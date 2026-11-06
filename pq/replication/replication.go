@@ -29,11 +29,11 @@ func New(conn pq.Connection) *Replication {
 
 // StartOptions carries the pgoutput options that shape START_REPLICATION.
 type StartOptions struct {
-	// ProtoVersion selects the pgoutput protocol version.
-	ProtoVersion int
 	// LogicalMessages selects the logical decoding message policy; its zero
 	// value (auto) requests the option whenever the server supports it.
 	LogicalMessages slot.LogicalMessagesMode
+	// ProtoVersion selects the pgoutput protocol version.
+	ProtoVersion int
 }
 
 // Start begins replication with the default pgoutput options for protoVersion.

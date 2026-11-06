@@ -25,12 +25,12 @@ import (
 // precedes the body, matching the other streamed decoders.
 type LogicalDecodingMessage struct {
 	MessageTime time.Time
-	Flags       uint8
+	Prefix      string
+	Content     []byte
 
-	LSN     pq.LSN
-	Prefix  string
-	Content []byte
-	XID     uint32
+	LSN   pq.LSN
+	XID   uint32
+	Flags uint8
 }
 
 func NewLogicalDecodingMessage(data []byte, streamedTransaction bool, serverTime time.Time) (*LogicalDecodingMessage, error) {
