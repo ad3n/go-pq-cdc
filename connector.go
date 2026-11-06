@@ -204,6 +204,7 @@ func initializeTimescaleDB(ctx context.Context, cfg config.Config) (*timescaledb
 		return nil, err
 	}
 	if _, err = tdb.FindHyperTables(ctx); err != nil {
+		tdb.Close(context.Background())
 		return nil, err
 	}
 	return tdb, nil
@@ -615,6 +616,9 @@ func (c *connector) Close() {
 		}
 		if c.heartbeat != nil {
 			c.heartbeat.Close(ctx)
+		}
+		if c.timescaleDB != nil {
+			c.timescaleDB.Close(ctx)
 		}
 		if c.stream != nil {
 			if err := c.stream.Close(ctx); err != nil {

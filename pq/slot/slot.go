@@ -39,9 +39,9 @@ type Slot struct {
 	replicationConn pq.Connection
 	metric          metric.Metric
 	logUpdater      XLogUpdater
-	metricsCtx      context.Context
+	ctx             context.Context
 	ticker          *time.Ticker
-	cancelMetrics   context.CancelFunc
+	cancel          context.CancelFunc
 	statusSQL       string
 	cfg             Config
 	workers         sync.WaitGroup
@@ -52,10 +52,10 @@ type Slot struct {
 func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, updater XLogUpdater) *Slot {
 	query := fmt.Sprintf("SELECT slot_name, slot_type, active, active_pid, restart_lsn, confirmed_flush_lsn, wal_status, PG_CURRENT_WAL_LSN() AS current_lsn FROM pg_replication_slots WHERE slot_name = '%s';", cfg.Name)
 
-	metricsCtx, cancelMetrics := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Slot{
-		metricsCtx:      metricsCtx,
-		cancelMetrics:   cancelMetrics,
+		ctx:             ctx,
+		cancel:          cancel,
 		cfg:             cfg,
 		conn:            pq.NewConnectionTemplate(standardDSN),
 		replicationConn: pq.NewConnectionTemplate(replicationDSN),
@@ -67,14 +67,29 @@ func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, up
 }
 
 func (s *Slot) Connect(ctx context.Context) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed.Load() {
+		return ErrorSlotClosed
+	}
+
 	return s.conn.Connect(ctx)
 }
 
 func (s *Slot) Create(ctx context.Context) (*Info, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed.Load() {
+		return nil, ErrorSlotClosed
+	}
 
 	if err := s.conn.Connect(ctx); err != nil {
 		return nil, errors.Wrap(err, "slot connect")
@@ -202,6 +217,9 @@ func (s *Slot) execReplicationCommand(ctx context.Context, sql string) error {
 }
 
 func (s *Slot) Info(ctx context.Context) (*Info, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -282,12 +300,8 @@ func (s *Slot) Metrics(ctx context.Context) {
 	s.mu.Unlock()
 	defer s.workers.Done()
 
-	ctx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(s.metricsCtx, cancel)
-	defer func() {
-		stop()
-		cancel()
-	}()
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 
 	for {
 		select {
@@ -321,7 +335,7 @@ func (s *Slot) Metrics(ctx context.Context) {
 
 func (s *Slot) Close(ctx context.Context) {
 	s.closed.Store(true)
-	s.cancelMetrics()
+	s.cancel()
 	s.ticker.Stop()
 
 	s.mu.Lock()
@@ -332,6 +346,15 @@ func (s *Slot) Close(ctx context.Context) {
 
 	if !s.conn.IsClosed() {
 		_ = s.conn.Close(ctx)
+	}
+}
+
+func (s *Slot) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.ctx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
 	}
 }
 

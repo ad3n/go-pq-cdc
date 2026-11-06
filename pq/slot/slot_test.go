@@ -4,6 +4,8 @@ import (
 	"context"
 	goerrors "errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -108,6 +110,7 @@ func (c *fakeSlotConn) Exec(ctx context.Context, sql string) *pgconn.MultiResult
 func newTestSlot(conn pq.Connection) *Slot {
 	logger.InitLogger(logger.NewSlog(slog.LevelError))
 	return &Slot{
+		ctx:       context.Background(),
 		cfg:       Config{Name: "test_slot"},
 		conn:      conn,
 		statusSQL: "SELECT 1",
@@ -345,5 +348,64 @@ func TestCloseCancelsActiveMetricsQueryAndJoinsWorker(t *testing.T) {
 
 	if err := <-conn.canceled; !goerrors.Is(err, context.Canceled) {
 		t.Fatalf("Close did not cancel the metrics query: %v", err)
+	}
+}
+
+func TestCloseCancelsStalledHTTPSlotQuery(t *testing.T) {
+	conn := &blockedMetricsConn{entered: make(chan struct{}), release: make(chan struct{}), canceled: make(chan error, 1)}
+	defer close(conn.release)
+
+	s := NewSlot("", "", Config{SlotActivityCheckerInterval: 3600000}, nil, nil)
+	s.conn = conn
+	requestContext := make(chan error, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := s.Info(r.Context())
+		requestContext <- r.Context().Err()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+	request := httptest.NewRequest(http.MethodGet, "/slot", nil)
+	response := httptest.NewRecorder()
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+
+		handler.ServeHTTP(response, request)
+	}()
+	select {
+	case <-conn.entered:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP slot query did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+
+		s.Close(t.Context())
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP slot query blocked shutdown")
+	}
+
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP slot request survived shutdown")
+	}
+
+	if err := <-requestContext; err != nil {
+		t.Fatalf("test relied on HTTP client cancellation: %v", err)
+	}
+
+	if err := <-conn.canceled; !goerrors.Is(err, context.Canceled) {
+		t.Fatalf("slot shutdown did not cancel the query: %v", err)
+	}
+
+	if response.Code != http.StatusInternalServerError || !conn.closed {
+		t.Fatal("HTTP request or connection was not cleaned up")
 	}
 }

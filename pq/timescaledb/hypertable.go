@@ -5,6 +5,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ad3n/go-pq-cdc/logger"
@@ -14,28 +15,58 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-var typeMap = pgtype.NewMap()
-
-var HyperTables = sync.Map{}
+var (
+	typeMap     = pgtype.NewMap()
+	HyperTables = sync.Map{}
+)
 
 type TimescaleDB struct {
-	conn   pq.Connection
-	ticker *time.Ticker
-}
-
-func NewTimescaleDB(ctx context.Context, dsn string) (*TimescaleDB, error) {
-	conn, err := pq.NewConnection(ctx, dsn)
-	if err != nil {
-		return nil, errors.Wrap(err, "new postgresql connection")
-	}
-
-	return &TimescaleDB{conn: conn, ticker: time.NewTicker(time.Second)}, nil
+	conn      pq.Connection
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	workers   sync.WaitGroup
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 func (tdb *TimescaleDB) SyncHyperTables(ctx context.Context) {
-	for range tdb.ticker.C {
+	tdb.mu.Lock()
+	if tdb.closed.Load() {
+		tdb.mu.Unlock()
+		return
+	}
+
+	tdb.workers.Add(1)
+	tdb.mu.Unlock()
+	defer func() {
+		tdb.workers.Done()
+		tdb.Close(context.Background())
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(tdb.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		hyperTables, err := tdb.FindHyperTables(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+
 			logger.Error("timescale tables", "error", err)
 			continue
 		}
@@ -44,15 +75,48 @@ func (tdb *TimescaleDB) SyncHyperTables(ctx context.Context) {
 	}
 }
 
+func (tdb *TimescaleDB) Close(ctx context.Context) {
+	tdb.closeOnce.Do(func() {
+		tdb.closed.Store(true)
+		tdb.cancel()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		tdb.mu.Lock()
+		defer func() {
+			tdb.mu.Unlock()
+			tdb.workers.Wait()
+		}()
+
+		tdb.conn.Close(ctx)
+	})
+}
+
 func (tdb *TimescaleDB) FindHyperTables(ctx context.Context) (map[string]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(tdb.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	tdb.mu.Lock()
+	defer tdb.mu.Unlock()
+
+	if tdb.closed.Load() {
+		return nil, context.Canceled
+	}
+
 	query := "SELECT h.hypertable_schema, h.hypertable_name, c.chunk_schema, c.chunk_name FROM timescaledb_information.chunks c JOIN timescaledb_information.hypertables h ON c.hypertable_schema = h.hypertable_schema AND c.hypertable_name = h.hypertable_name;"
 	resultReader := tdb.conn.Exec(ctx, query)
+	defer resultReader.Close()
+
 	results, err := resultReader.ReadAll()
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if goerrors.As(err, &pgErr) {
 			if pgErr.Code == "42P01" {
-				tdb.ticker.Stop()
+				tdb.cancel()
 				logger.Debug("timescale db hypertable relation not found", "error", err)
 				return nil, nil
 			}
@@ -79,6 +143,16 @@ func (tdb *TimescaleDB) FindHyperTables(ctx context.Context) (map[string]string,
 	}
 
 	return ht, nil
+}
+
+func NewTimescaleDB(ctx context.Context, dsn string) (*TimescaleDB, error) {
+	conn, err := pq.NewConnection(ctx, dsn)
+	if err != nil {
+		return nil, errors.Wrap(err, "new postgresql connection")
+	}
+
+	owner, cancel := context.WithCancel(context.Background())
+	return &TimescaleDB{conn: conn, ctx: owner, cancel: cancel}, nil
 }
 
 func decodeHyperTablesResult(results []*pgconn.Result) (map[string]string, error) {
