@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq/message/tuple"
+	"github.com/ad3n/go-pq-cdc/pq/message/tuple"
 	"github.com/stretchr/testify/assert"
 )
 

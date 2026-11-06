@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

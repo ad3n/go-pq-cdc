@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/internal/metric"
+	"github.com/ad3n/go-pq-cdc/config"
+	"github.com/ad3n/go-pq-cdc/internal/metric"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

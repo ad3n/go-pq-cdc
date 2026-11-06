@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq"
 	"github.com/stretchr/testify/assert"
 )
 

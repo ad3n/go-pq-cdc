@@ -5,7 +5,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/stretchr/testify/assert"

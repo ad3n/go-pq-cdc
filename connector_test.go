@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/ad3n/go-pq-cdc/logger"
 )
 
 func TestCaptureSlotStopsOnCancellation(t *testing.T) {

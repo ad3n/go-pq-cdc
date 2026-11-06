@@ -5,12 +5,12 @@ import (
 	"log/slog"
 	"os"
 
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	cdc "github.com/ad3n/go-pq-cdc"
+	"github.com/ad3n/go-pq-cdc/config"
+	"github.com/ad3n/go-pq-cdc/pq/message/format"
+	"github.com/ad3n/go-pq-cdc/pq/publication"
+	"github.com/ad3n/go-pq-cdc/pq/replication"
+	"github.com/ad3n/go-pq-cdc/pq/slot"
 )
 
 /*

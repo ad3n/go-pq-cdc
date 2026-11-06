@@ -1,7 +1,7 @@
 package slot
 
 import (
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq"
 )
 
 const (

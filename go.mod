@@ -1,4 +1,4 @@
-module github.com/Trendyol/go-pq-cdc
+module github.com/ad3n/go-pq-cdc
 
 go 1.25.0
 

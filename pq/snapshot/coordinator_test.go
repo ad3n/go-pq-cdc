@@ -3,8 +3,8 @@ package snapshot
 import (
 	"testing"
 
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/ad3n/go-pq-cdc/config"
+	"github.com/ad3n/go-pq-cdc/pq/publication"
 	"github.com/stretchr/testify/assert"
 )
 

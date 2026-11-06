@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
-	"github.com/Trendyol/go-pq-cdc/pq/snapshot"
+	cdc "github.com/ad3n/go-pq-cdc"
+	"github.com/ad3n/go-pq-cdc/pq/message/format"
+	"github.com/ad3n/go-pq-cdc/pq/publication"
+	"github.com/ad3n/go-pq-cdc/pq/replication"
+	"github.com/ad3n/go-pq-cdc/pq/snapshot"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -3,8 +3,8 @@ package replication
 import (
 	"testing"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
+	"github.com/ad3n/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq/message/format"
 	"github.com/stretchr/testify/assert"
 )
 

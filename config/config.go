@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	"github.com/ad3n/go-pq-cdc/logger"
+	"github.com/ad3n/go-pq-cdc/pq/publication"
+	"github.com/ad3n/go-pq-cdc/pq/slot"
 )
 
 const defaultSchema = "public"

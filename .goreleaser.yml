@@ -3,7 +3,7 @@ project_name: go-pq-cdc
 release:
   github:
     name: go-pq-cdc
-    owner: Trendyol
+    owner: ad3n
 
 before:
   hooks:

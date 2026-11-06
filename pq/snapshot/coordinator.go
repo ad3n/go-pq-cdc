@@ -9,10 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/ad3n/go-pq-cdc/logger"
+	"github.com/ad3n/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq/message/format"
+	"github.com/ad3n/go-pq-cdc/pq/publication"
 	"github.com/go-playground/errors"
 )
 

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	cdc "github.com/ad3n/go-pq-cdc"
+	"github.com/ad3n/go-pq-cdc/config"
+	"github.com/ad3n/go-pq-cdc/pq/message/format"
+	"github.com/ad3n/go-pq-cdc/pq/replication"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 )
@@ -45,7 +45,7 @@ func lowerLogicalDecodingWorkMem(ctx context.Context, t *testing.T) {
 // streaming protocol (STREAM START / STREAM STOP / STREAM COMMIT) for a large
 // in-progress transaction, every single row is delivered to the handler.
 //
-// This is the regression test for https://github.com/Trendyol/go-pq-cdc/issues/85
+// This is the regression test for https://github.com/ad3n/go-pq-cdc/issues/85
 // Before the fix, the last message of each streaming chunk was held in a buffer
 // and never flushed at STREAM STOP, causing a small number of rows to be lost.
 func TestStreamingLargeTransactionCommit(t *testing.T) {

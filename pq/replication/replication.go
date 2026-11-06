@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	"github.com/ad3n/go-pq-cdc/pq"
+	"github.com/ad3n/go-pq-cdc/pq/slot"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"

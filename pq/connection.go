@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/internal/retry"
+	"github.com/ad3n/go-pq-cdc/internal/retry"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
