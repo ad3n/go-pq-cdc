@@ -316,7 +316,7 @@ func (c *connector) Start(ctx context.Context) {
 
 	signal.Notify(c.cancelCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGABRT, syscall.SIGQUIT)
 
-	c.readyCh <- struct{}{}
+	close(c.readyCh)
 
 	<-c.cancelCh
 	logger.Debug("cancel channel triggered")
@@ -584,6 +584,8 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-c.cancelCh:
+		return context.Canceled
 	}
 }
 
@@ -601,9 +603,6 @@ func (c *connector) Close() {
 		signal.Stop(c.cancelCh)
 		if !isClosed(c.cancelCh) {
 			close(c.cancelCh)
-		}
-		if !isClosed(c.readyCh) {
-			close(c.readyCh)
 		}
 
 		// Close snapshotter connections if still open (fallback for crash/error scenarios)
@@ -644,7 +643,13 @@ func (c *connector) CaptureSlot(ctx context.Context) {
 	logger.Info("slot capturing...")
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		info, err := c.slot.Info(ctx)
 		if err != nil {
 			if goerrors.Is(err, slot.ErrorSlotClosed) {
