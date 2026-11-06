@@ -39,9 +39,12 @@ type Slot struct {
 	replicationConn pq.Connection
 	metric          metric.Metric
 	logUpdater      XLogUpdater
+	metricsCtx      context.Context
 	ticker          *time.Ticker
+	cancelMetrics   context.CancelFunc
 	statusSQL       string
 	cfg             Config
+	workers         sync.WaitGroup
 	mu              sync.Mutex
 	closed          atomic.Bool
 }
@@ -49,7 +52,10 @@ type Slot struct {
 func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, updater XLogUpdater) *Slot {
 	query := fmt.Sprintf("SELECT slot_name, slot_type, active, active_pid, restart_lsn, confirmed_flush_lsn, wal_status, PG_CURRENT_WAL_LSN() AS current_lsn FROM pg_replication_slots WHERE slot_name = '%s';", cfg.Name)
 
+	metricsCtx, cancelMetrics := context.WithCancel(context.Background())
 	return &Slot{
+		metricsCtx:      metricsCtx,
+		cancelMetrics:   cancelMetrics,
 		cfg:             cfg,
 		conn:            pq.NewConnectionTemplate(standardDSN),
 		replicationConn: pq.NewConnectionTemplate(replicationDSN),
@@ -266,7 +272,30 @@ func (s *Slot) execStatusQueryLocked(ctx context.Context) ([]*pgconn.Result, err
 }
 
 func (s *Slot) Metrics(ctx context.Context) {
-	for range s.ticker.C {
+	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return
+	}
+
+	s.workers.Add(1)
+	s.mu.Unlock()
+	defer s.workers.Done()
+
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.metricsCtx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.ticker.C:
+		}
+
 		if s.closed.Load() {
 			return
 		}
@@ -292,10 +321,14 @@ func (s *Slot) Metrics(ctx context.Context) {
 
 func (s *Slot) Close(ctx context.Context) {
 	s.closed.Store(true)
+	s.cancelMetrics()
 	s.ticker.Stop()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer func() {
+		s.mu.Unlock()
+		s.workers.Wait()
+	}()
 
 	if !s.conn.IsClosed() {
 		_ = s.conn.Close(ctx)

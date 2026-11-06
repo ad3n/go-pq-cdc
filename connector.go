@@ -601,9 +601,7 @@ func (c *connector) Close() {
 
 		// Close signal channels
 		signal.Stop(c.cancelCh)
-		if !isClosed(c.cancelCh) {
-			close(c.cancelCh)
-		}
+		close(c.cancelCh)
 
 		// Close snapshotter connections if still open (fallback for crash/error scenarios)
 		// Normal flow: connections are already closed in finalizeSnapshot() when snapshot completes
@@ -666,14 +664,4 @@ func (c *connector) CaptureSlot(ctx context.Context) {
 		logger.Debug("capture slot", "slotInfo", info)
 		break
 	}
-}
-
-func isClosed[T any](ch <-chan T) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-	}
-
-	return false
 }

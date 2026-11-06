@@ -4,7 +4,9 @@ import (
 	"context"
 	goerrors "errors"
 	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ad3n/go-pq-cdc/logger"
 	"github.com/ad3n/go-pq-cdc/pq"
@@ -12,6 +14,32 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+type blockedMetricsConn struct {
+	pq.Connection
+	entered  chan struct{}
+	release  chan struct{}
+	canceled chan error
+	closed   bool
+}
+
+func (c *blockedMetricsConn) IsClosed() bool { return c.closed }
+
+func (c *blockedMetricsConn) Close(context.Context) error {
+	c.closed = true
+	return nil
+}
+
+func (c *blockedMetricsConn) Exec(ctx context.Context, sql string) *pgconn.MultiResultReader {
+	close(c.entered)
+	select {
+	case <-ctx.Done():
+	case <-c.release:
+	}
+
+	c.canceled <- ctx.Err()
+	return (&pgconn.PgConn{}).Exec(ctx, sql)
+}
 
 func TestReplicationSlotCommandsQuoteTheName(t *testing.T) {
 	if got := createReplicationSlotCommand("test-slot", false); got != `CREATE_REPLICATION_SLOT "test-slot" LOGICAL pgoutput` {
@@ -219,5 +247,103 @@ func TestDecodeSlotInfoResult_EmptyConfirmedFlushLSN(t *testing.T) {
 	}
 	if info.Type != Physical {
 		t.Fatalf("expected Physical type, got: %v", info.Type)
+	}
+}
+
+func TestMetricsStopsAfterCancellationOrClose(t *testing.T) {
+	for _, cancelParent := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(t.Context())
+		s := NewSlot("", "", Config{SlotActivityCheckerInterval: 3600000}, nil, nil)
+		s.conn = &fakeSlotConn{closed: true}
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+
+			s.Metrics(ctx)
+		}()
+		if cancelParent {
+			cancel()
+		}
+
+		if !cancelParent {
+			s.Close(t.Context())
+		}
+
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			s.closed.Store(true)
+			s.ticker.Reset(time.Millisecond)
+			<-finished
+			t.Error("metrics worker did not stop after cancellation or Close")
+		}
+
+		cancel()
+		s.Close(t.Context())
+	}
+}
+
+func TestMetricsConcurrentAdmissionAndClose(t *testing.T) {
+	for range 32 {
+		s := NewSlot("", "", Config{SlotActivityCheckerInterval: 3600000}, nil, nil)
+		s.conn = &fakeSlotConn{closed: true}
+		var workers sync.WaitGroup
+		for range 8 {
+			workers.Go(func() { s.Metrics(t.Context()) })
+			workers.Go(func() { s.Close(t.Context()) })
+		}
+
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+
+			workers.Wait()
+		}()
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent metrics admission and Close deadlocked")
+		}
+	}
+}
+
+func TestCloseCancelsActiveMetricsQueryAndJoinsWorker(t *testing.T) {
+	conn := &blockedMetricsConn{entered: make(chan struct{}), release: make(chan struct{}), canceled: make(chan error, 1)}
+	defer close(conn.release)
+
+	s := NewSlot("", "", Config{SlotActivityCheckerInterval: 1}, nil, nil)
+	s.conn = conn
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+
+		s.Metrics(t.Context())
+	}()
+	select {
+	case <-conn.entered:
+	case <-time.After(time.Second):
+		t.Fatal("metrics query did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+
+		s.Close(t.Context())
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close deadlocked waiting for the metrics query mutex")
+	}
+
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("metrics worker survived Close")
+	}
+
+	if err := <-conn.canceled; !goerrors.Is(err, context.Canceled) {
+		t.Fatalf("Close did not cancel the metrics query: %v", err)
 	}
 }
