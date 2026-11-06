@@ -144,8 +144,17 @@ func (s *Snapshotter) workerProcess(ctx context.Context, slotName, instanceID st
 func (s *Snapshotter) startHeartbeat(ctx context.Context) (cancel context.CancelFunc, chunkChan chan<- int64) {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	currentChunk := make(chan int64, 1)
-	go s.heartbeatWorker(heartbeatCtx, currentChunk, s.config.HeartbeatInterval)
-	return cancelHeartbeat, currentChunk
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+
+		s.heartbeatWorker(heartbeatCtx, currentChunk, s.config.HeartbeatInterval)
+	}()
+
+	return func() {
+		cancelHeartbeat()
+		<-done
+	}, currentChunk
 }
 
 // processNextChunk claims and processes a single chunk
@@ -405,6 +414,10 @@ func (s *Snapshotter) heartbeatWorker(ctx context.Context, currentChunk <-chan i
 	defer ticker.Stop()
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+
 		select {
 		case <-ctx.Done():
 			return

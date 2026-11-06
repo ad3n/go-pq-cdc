@@ -53,16 +53,34 @@ type orderByCacheEntry struct {
 	columns []string
 }
 
-func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publication.Tables, dsn string, m metric.Metric) (*Snapshotter, error) {
+func New(ctx context.Context, snapshotConfig config.SnapshotConfig, tables publication.Tables, dsn string, m metric.Metric) (_ *Snapshotter, err error) {
 	metadataConn, err := pq.NewConnection(ctx, dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "create metadata connection")
 	}
 
+	defer func() {
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			metadataConn.Close(cleanupCtx)
+		}
+	}()
+
 	healthcheckConn, err := pq.NewConnection(ctx, dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "create healthcheck connection")
 	}
+
+	defer func() {
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			healthcheckConn.Close(cleanupCtx)
+		}
+	}()
 
 	// Create connection pool for chunk processing (5 connections)
 	connectionPool, err := NewConnectionPool(ctx, dsn, 5)

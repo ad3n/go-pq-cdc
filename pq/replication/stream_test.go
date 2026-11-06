@@ -165,3 +165,20 @@ func (c *standbyCaptureConn) Frontend() *pgproto3.Frontend {
 func (c *standbyCaptureConn) Exec(context.Context, string) *pgconn.MultiResultReader {
 	return nil
 }
+
+func TestFetchSnapshotLSNStopsOnCancellation(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	s := &stream{config: config.Config{}}
+	done := make(chan error, 1)
+	go func() { _, err := s.fetchSnapshotLSN(ctx); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+			t.Fatalf("expected cancellation, got %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("snapshot LSN retry ignored cancellation")
+	}
+}

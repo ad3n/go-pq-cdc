@@ -1102,8 +1102,9 @@ func (s *stream) fetchSnapshotLSN(ctx context.Context) (pq.LSN, error) {
 
 			return nil
 		},
-		retry.Attempts(0),                   // 0 means infinite retries
-		retry.DelayType(retry.BackOffDelay), // Exponential backoff
+		retry.Context(ctx),
+		retry.Attempts(0),
+		retry.DelayType(retry.BackOffDelay),
 		retry.OnRetry(func(n uint, err error) {
 			logger.Error("error in snapshot LSN fetch, retrying",
 				"attempt", n+1,

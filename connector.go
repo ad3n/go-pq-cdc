@@ -123,6 +123,16 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 
 	tdb, err := initializeTimescaleDB(ctx, cfg)
 	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		snapshotter.Close(cleanupCtx)
+		sl.Close(cleanupCtx)
+		stream.Close(cleanupCtx)
+		if hb != nil {
+			hb.Close(cleanupCtx)
+		}
+
 		return nil, err
 	}
 

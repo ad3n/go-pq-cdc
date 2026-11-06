@@ -66,14 +66,18 @@ func (c *connection) SetWriteDeadline(t time.Time) error {
 }
 
 func connect(ctx context.Context, dsn string) (*pgconn.PgConn, error) {
-	retryConfig := retry.OnErrorConfig[*pgconn.PgConn](5, func(err error) bool { return err == nil })
-	conn, err := retryConfig.Do(func() (*pgconn.PgConn, error) {
+	retryConfig := retry.OnErrorConfig[*pgconn.PgConn](5)
+	conn, err := retryConfig.Do(ctx, func() (*pgconn.PgConn, error) {
 		conn, err := pgconn.Connect(ctx, dsn)
 		if err != nil {
 			return nil, err
 		}
 
 		if err = conn.Ping(ctx); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			conn.Close(cleanupCtx)
+			cancel()
+
 			return nil, err
 		}
 
