@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ad3n/go-pq-cdc/config"
@@ -12,31 +13,18 @@ import (
 	"github.com/ad3n/go-pq-cdc/pq"
 )
 
-// quoteIdentifier quotes a PostgreSQL identifier (schema, table, column name)
-// to handle reserved words, special characters, and embedded quotes safely.
-func quoteIdentifier(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-// Heartbeat manages periodic heartbeat updates to prevent WAL bloat
 type Heartbeat struct {
-	conn   pq.Connection
-	dsn    string
-	cfg    config.HeartbeatConfig
-	mu     sync.Mutex
-	closed bool
+	conn      pq.Connection
+	ctx       context.Context
+	cancel    context.CancelFunc
+	dsn       string
+	cfg       config.HeartbeatConfig
+	mu        sync.Mutex
+	workers   sync.WaitGroup
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
-// New creates a new Heartbeat instance
-func New(dsn string, cfg config.HeartbeatConfig) *Heartbeat {
-	return &Heartbeat{
-		dsn: dsn,
-		cfg: cfg,
-	}
-}
-
-// EnsureTable checks if the heartbeat table exists and creates it only when missing.
-// This avoids permission errors for users who only have replication privileges.
 func (h *Heartbeat) EnsureTable(ctx context.Context, conn pq.Connection) error {
 	schema := quoteIdentifier(h.cfg.Table.Schema)
 	table := quoteIdentifier(h.cfg.Table.Name)
@@ -50,6 +38,7 @@ func (h *Heartbeat) EnsureTable(ctx context.Context, conn pq.Connection) error {
 		if err := h.createTable(ctx, conn); err != nil {
 			return err
 		}
+
 		logger.Info("heartbeat table created", "table", schema+"."+table)
 	}
 
@@ -59,6 +48,78 @@ func (h *Heartbeat) EnsureTable(ctx context.Context, conn pq.Connection) error {
 
 	logger.Info("heartbeat table ready to use", "table", schema+"."+table)
 	return nil
+}
+
+func (h *Heartbeat) Run(ctx context.Context) {
+	h.mu.Lock()
+	if h.closed.Load() {
+		h.mu.Unlock()
+		return
+	}
+
+	h.workers.Add(1)
+	h.mu.Unlock()
+	defer func() {
+		h.closed.Store(true)
+		h.cancel()
+		h.closeConnection(context.Background())
+		h.workers.Done()
+	}()
+
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(h.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	logger.Debug("heartbeat loop started",
+		"interval", h.cfg.Interval,
+		"table", h.cfg.Table.Schema+"."+h.cfg.Table.Name)
+
+	ticker := time.NewTicker(h.cfg.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("heartbeat loop stopped", "reason", ctx.Err())
+			return
+		case <-ticker.C:
+			if err := h.execute(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
+				logger.Error("heartbeat execution failed", "error", err)
+				continue
+			}
+
+			logger.Debug("heartbeat query executed")
+		}
+	}
+}
+
+func (h *Heartbeat) Close(ctx context.Context) {
+	h.closeOnce.Do(func() {
+		h.closed.Store(true)
+		h.cancel()
+		h.closeConnection(ctx)
+		h.workers.Wait()
+	})
+}
+
+func (h *Heartbeat) closeConnection(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.conn != nil {
+		h.conn.Close(ctx)
+		h.conn = nil
+	}
 }
 
 func (h *Heartbeat) createTable(ctx context.Context, conn pq.Connection) error {
@@ -76,6 +137,7 @@ func (h *Heartbeat) createTable(ctx context.Context, conn pq.Connection) error {
 	if err := pq.ExecSQL(ctx, conn, sql); err != nil {
 		return fmt.Errorf("create heartbeat table failed: %w", err)
 	}
+
 	return nil
 }
 
@@ -89,48 +151,24 @@ func (h *Heartbeat) insertInitialRow(ctx context.Context, conn pq.Connection) er
 	if err := pq.ExecSQL(ctx, conn, sql); err != nil {
 		return fmt.Errorf("insert heartbeat row failed: %w", err)
 	}
+
 	return nil
 }
 
-// Run starts the heartbeat loop. It blocks until context is cancelled.
-func (h *Heartbeat) Run(ctx context.Context) {
-	logger.Debug("heartbeat loop started",
-		"interval", h.cfg.Interval,
-		"table", h.cfg.Table.Schema+"."+h.cfg.Table.Name)
-
-	ticker := time.NewTicker(h.cfg.Interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("heartbeat loop stopped", "reason", ctx.Err())
-			return
-		case <-ticker.C:
-			if err := h.execute(ctx); err != nil {
-				logger.Error("heartbeat execution failed", "error", err)
-			} else {
-				logger.Debug("heartbeat query executed")
-			}
-		}
-	}
-}
-
-// execute runs a single heartbeat update
 func (h *Heartbeat) execute(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if h.closed {
-		return nil
+	if h.closed.Load() {
+		return context.Canceled
 	}
 
-	// Lazily (re)establish connection if needed
 	if h.conn == nil {
 		conn, err := pq.NewConnection(ctx, h.dsn)
 		if err != nil {
 			return fmt.Errorf("heartbeat connection (re)establish failed: %w", err)
 		}
+
 		h.conn = conn
 	}
 
@@ -147,9 +185,7 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 
 	rows, err := resultReader.ReadAll()
 	if err != nil {
-		// On error, proactively close and nil the connection so that the next
-		// heartbeat tick will try to re-establish it.
-		_ = h.conn.Close(ctx)
+		h.conn.Close(ctx)
 		h.conn = nil
 		return fmt.Errorf("heartbeat query failed: %w", err)
 	}
@@ -163,21 +199,22 @@ func (h *Heartbeat) execute(ctx context.Context) error {
 	return nil
 }
 
-// query returns the auto-generated UPDATE query for heartbeat
 func (h *Heartbeat) query() string {
 	schema := quoteIdentifier(h.cfg.Table.Schema)
 	table := quoteIdentifier(h.cfg.Table.Name)
 	return fmt.Sprintf(`UPDATE %s.%s SET last_heartbeat = NOW() WHERE id = 1 RETURNING 1`, schema, table)
 }
 
-// Close closes the heartbeat connection
-func (h *Heartbeat) Close(ctx context.Context) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.closed = true
-	if h.conn != nil {
-		_ = h.conn.Close(ctx)
-		h.conn = nil
+func New(dsn string, cfg config.HeartbeatConfig) *Heartbeat {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Heartbeat{
+		ctx:    ctx,
+		cancel: cancel,
+		dsn:    dsn,
+		cfg:    cfg,
 	}
+}
+
+func quoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

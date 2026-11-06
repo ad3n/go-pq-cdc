@@ -3,6 +3,7 @@ package cdc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -209,5 +210,88 @@ func waitClosedConnections(t *testing.T, opened, closed *atomic.Int32, expected 
 	}
 	if opened.Load() != expected || closed.Load() != expected {
 		t.Fatalf("connections opened=%d closed=%d, want %d each", opened.Load(), closed.Load(), expected)
+	}
+}
+
+func TestSnapshotRetryCancellation(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	for _, mode := range []string{"before", "during", "delay", "error", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			if mode == "deadline" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), 20*time.Millisecond)
+			}
+			defer cancel()
+
+			if mode == "before" {
+				cancel()
+			}
+			entered := make(chan struct{})
+			calls := 0
+			done := make(chan error, 1)
+			go func() {
+				done <- (&connector{}).retryOperation(ctx, "snapshot", 3, func() error {
+					calls++
+					if calls == 1 {
+						close(entered)
+					}
+					if mode == "during" {
+						<-ctx.Done()
+						return ctx.Err()
+					}
+					if mode == "error" {
+						return fmt.Errorf("operation: %w", context.Canceled)
+					}
+					return errors.New("temporary failure")
+				})
+			}()
+			if mode == "during" || mode == "delay" {
+				select {
+				case <-entered:
+				case <-time.After(time.Second):
+					t.Fatal("operation not entered")
+				}
+				if mode == "delay" {
+					time.Sleep(20 * time.Millisecond)
+				}
+				cancel()
+			}
+			select {
+			case err := <-done:
+				expectedErr := context.Canceled
+				if mode == "deadline" {
+					expectedErr = context.DeadlineExceeded
+				}
+
+				if !errors.Is(err, expectedErr) {
+					t.Fatalf("expected %v, got %v", expectedErr, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("retry did not stop on cancellation")
+			}
+			expected := 1
+			if mode == "before" {
+				expected = 0
+			}
+			if calls != expected {
+				t.Fatalf("calls=%d want %d", calls, expected)
+			}
+		})
+	}
+}
+
+func TestSnapshotRetryPreservesTransientRecovery(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	calls := 0
+	err := (&connector{}).retryOperation(t.Context(), "snapshot", 2, func() error {
+		calls++
+		if calls == 1 {
+			return errors.New("temporary failure")
+		}
+		return nil
+	})
+	if err != nil || calls != 2 {
+		t.Fatalf("calls=%d error=%v", calls, err)
 	}
 }

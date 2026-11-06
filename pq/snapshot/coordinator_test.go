@@ -1,12 +1,27 @@
 package snapshot
 
 import (
+	"context"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 
 	"github.com/ad3n/go-pq-cdc/config"
+	"github.com/ad3n/go-pq-cdc/logger"
+	"github.com/ad3n/go-pq-cdc/pq"
 	"github.com/ad3n/go-pq-cdc/pq/publication"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/stretchr/testify/assert"
 )
+
+type failingMetadataConnection struct{ pq.Connection }
+
+func (failingMetadataConnection) Exec(ctx context.Context, sql string) *pgconn.MultiResultReader {
+	return (&pgconn.PgConn{}).Exec(ctx, sql)
+}
+
+func (failingMetadataConnection) Close(context.Context) error { return nil }
 
 func ptrInt64(v int64) *int64 { return &v }
 
@@ -309,4 +324,118 @@ func TestBuildChunkValueStringIncludesPhysicalPartition(t *testing.T) {
 	chunk.PhysicalTableName = ""
 	value = s.buildChunkValueString(chunk)
 	assert.Contains(t, value, "'public', 'events', NULL, NULL")
+}
+
+func TestCoordinatorFailureClosesExportBeforeRetry(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	addr, opened, closed := startLifecyclePostgres(t, exportSnapshotResponse)
+	s := &Snapshotter{dsn: "postgres://test:test@" + addr + "/test?sslmode=disable", metadataConn: failingMetadataConnection{}}
+	defer s.Close(context.Background())
+
+	for attempt := int32(1); attempt <= 3; attempt++ {
+		if err := s.initializeCoordinator(t.Context(), "test", 0); err == nil {
+			t.Fatal("expected metadata failure")
+		}
+		waitClosedConnections(t, opened, closed, attempt)
+		if s.exportSnapshotConn != nil || s.keepaliveDone != nil || s.keepaliveCancel != nil {
+			t.Fatal("failed attempt retained export resources")
+		}
+	}
+}
+
+func TestExportReplacementStopsPreviousKeepaliveAndClosesConnection(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	var rollbacks atomic.Int32
+	addr, opened, closed := startLifecyclePostgres(t, func(id int32, sql string, backend *pgproto3.Backend) bool {
+		if sql == "ROLLBACK" {
+			rollbacks.Add(1)
+		}
+		return exportSnapshotResponse(id, sql, backend)
+	})
+	s := &Snapshotter{dsn: "postgres://test:test@" + addr + "/test?sslmode=disable"}
+	defer s.Close(context.Background())
+
+	if err := s.exportSnapshotTransaction(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	previous := s.exportSnapshotConn
+	previousDone := s.keepaliveDone
+	if err := s.exportSnapshotTransaction(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !previous.IsClosed() {
+		t.Fatal("previous export connection is still open")
+	}
+	select {
+	case <-previousDone:
+	default:
+		t.Fatal("previous keepalive still running")
+	}
+	currentDone := s.keepaliveDone
+	s.Close(context.Background())
+	select {
+	case <-currentDone:
+	default:
+		t.Fatal("final keepalive still running")
+	}
+	waitClosedConnections(t, opened, closed, 2)
+	if rollbacks.Load() != 2 {
+		t.Fatalf("rollback count=%d want 2", rollbacks.Load())
+	}
+}
+
+func TestCanceledExportReplacementCleansPreviousConnection(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	addr, opened, closed := startLifecyclePostgres(t, exportSnapshotResponse)
+	s := &Snapshotter{dsn: "postgres://test:test@" + addr + "/test?sslmode=disable"}
+	defer s.Close(context.Background())
+
+	if err := s.exportSnapshotTransaction(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	previousDone := s.keepaliveDone
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := s.exportSnapshotTransaction(ctx); err == nil {
+		t.Fatal("expected cancellation")
+	}
+	select {
+	case <-previousDone:
+	default:
+		t.Fatal("previous keepalive still running")
+	}
+	waitClosedConnections(t, opened, closed, 1)
+}
+
+func exportSnapshotResponse(_ int32, sql string, backend *pgproto3.Backend) bool {
+	if sql != "SELECT pg_export_snapshot()" {
+		return false
+	}
+	backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{Name: []byte("pg_export_snapshot"), DataTypeOID: 25, DataTypeSize: -1}}})
+	backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("snapshot")}})
+	backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+	return true
+}
+
+func TestExportFailureCleansConnection(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	addr, opened, closed := startLifecyclePostgres(t, func(_ int32, sql string, backend *pgproto3.Backend) bool {
+		if sql != "SELECT pg_export_snapshot()" {
+			return false
+		}
+
+		backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42501", Message: "permission denied"})
+		return true
+	})
+	s := &Snapshotter{dsn: "postgres://test:test@" + addr + "/test?sslmode=disable"}
+	defer s.Close(context.Background())
+
+	if err := s.exportSnapshotTransaction(t.Context()); err == nil {
+		t.Fatal("expected export failure")
+	}
+
+	waitClosedConnections(t, opened, closed, 1)
+	if s.exportSnapshotConn != nil || s.keepaliveDone != nil || s.keepaliveCancel != nil {
+		t.Fatal("failed export retained resources")
+	}
 }

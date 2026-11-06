@@ -369,7 +369,7 @@ func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
 // 3. Execute: Collect snapshot data
 // This ensures no WAL changes are lost during snapshot execution
 func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
-	return c.retryOperation("snapshot", 3, func(_ int) error {
+	return c.retryOperation(ctx, "snapshot", 3, func() error {
 		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL)
 		slotInfo, err := c.slot.Create(ctx)
 		if err != nil {
@@ -553,22 +553,36 @@ func (c *connector) calculateNextDelay(currentDelay, maxDelay time.Duration, mul
 }
 
 // retryOperation executes an operation with retry logic
-func (c *connector) retryOperation(operationName string, maxRetries int, operation func(attempt int) error) error {
+func (c *connector) retryOperation(ctx context.Context, operationName string, maxRetries int, operation func() error) error {
 	var lastErr error
 	retryDelay := 5 * time.Second
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if attempt > 1 {
 			logger.Info("retrying operation", "operation", operationName, "attempt", attempt, "maxRetries", maxRetries)
 		}
 
-		if err := operation(attempt); err != nil {
+		if err := operation(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if goerrors.Is(err, context.Canceled) || goerrors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+
 			lastErr = err
 			logger.Warn("operation failed", "operation", operationName, "attempt", attempt, "error", err)
 
 			if attempt < maxRetries {
 				logger.Info("waiting before retry", "retryDelay", retryDelay.String())
-				time.Sleep(retryDelay)
+				if err := c.waitWithContext(ctx, retryDelay); err != nil {
+					return err
+				}
 			}
 			continue
 		}

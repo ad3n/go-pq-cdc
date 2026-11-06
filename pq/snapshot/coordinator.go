@@ -58,6 +58,10 @@ func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string
 	// Create metadata and chunks using the snapshot connection
 	// This guarantees chunk boundaries match the exported snapshot
 	if err := s.createMetadata(ctx, slotName, currentLSN); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		s.closeExportSnapshotConnection(cleanupCtx, false)
 		return errors.Wrap(err, "create metadata")
 	}
 
@@ -111,21 +115,20 @@ func (s *Snapshotter) createMetadata(ctx context.Context, slotName string, curre
 // This transaction is kept OPEN for workers to use the same snapshot
 // The snapshot ID is cached and will be used when creating job metadata
 func (s *Snapshotter) exportSnapshotTransaction(ctx context.Context) error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s.closeExportSnapshotConnection(cleanupCtx, false)
+	cancel()
+
 	exportSnapshotConn, err := pq.NewConnection(ctx, s.dsn)
 	if err != nil {
 		return errors.Wrap(err, "create pg export snapshot connection")
 	}
 
 	cleanupFailedExportConnection := func() {
-		_ = s.execSQL(ctx, exportSnapshotConn, "ROLLBACK")
-		_ = exportSnapshotConn.Close(ctx)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-		s.keepaliveMu.Lock()
-		if s.exportSnapshotConn == exportSnapshotConn {
-			s.exportSnapshotConn = nil
-		}
-		s.exportConnClosed = true
-		s.keepaliveMu.Unlock()
+		s.closeExportSnapshotConnection(cleanupCtx, false)
 	}
 
 	s.keepaliveMu.Lock()

@@ -277,14 +277,12 @@ func (s *Snapshotter) Close(ctx context.Context) {
 }
 
 func (s *Snapshotter) startSnapshotKeepalive(parentCtx context.Context, conn pq.Connection) {
+	s.stopSnapshotKeepalive()
+
 	keepaliveCtx, keepaliveCancel := context.WithCancel(parentCtx)
 	done := make(chan struct{})
 
 	s.keepaliveMu.Lock()
-	// Ensure previous keepalive is not left around during retries.
-	if s.keepaliveCancel != nil {
-		s.keepaliveCancel()
-	}
 	s.keepaliveCancel = keepaliveCancel
 	s.keepaliveDone = done
 	s.exportConnClosed = false
