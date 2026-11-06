@@ -65,6 +65,8 @@ func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string
 		return errors.Wrap(err, "create metadata")
 	}
 
+	s.startSnapshotKeepalive(ctx, s.exportSnapshotConn)
+
 	logger.Debug("[coordinator] initialization complete")
 	return nil
 }
@@ -161,8 +163,6 @@ func (s *Snapshotter) exportSnapshotTransaction(ctx context.Context) error {
 		cleanupFailedExportConnection()
 		return errors.Wrap(err, "export snapshot")
 	}
-
-	s.startSnapshotKeepalive(ctx, exportSnapshotConn)
 
 	// Cache snapshot ID - will be used when creating job metadata
 	s.cachedSnapshotID = snapshotID

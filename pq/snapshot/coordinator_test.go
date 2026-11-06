@@ -2,7 +2,9 @@ package snapshot
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -16,6 +18,16 @@ import (
 )
 
 type failingMetadataConnection struct{ pq.Connection }
+
+type observedMetadataConnection struct {
+	pq.Connection
+	before func(string)
+}
+
+func (c *observedMetadataConnection) Exec(ctx context.Context, sql string) *pgconn.MultiResultReader {
+	c.before(sql)
+	return c.Connection.Exec(ctx, sql)
+}
 
 func (failingMetadataConnection) Exec(ctx context.Context, sql string) *pgconn.MultiResultReader {
 	return (&pgconn.PgConn{}).Exec(ctx, sql)
@@ -359,6 +371,7 @@ func TestExportReplacementStopsPreviousKeepaliveAndClosesConnection(t *testing.T
 		t.Fatal(err)
 	}
 	previous := s.exportSnapshotConn
+	s.startSnapshotKeepalive(t.Context(), s.exportSnapshotConn)
 	previousDone := s.keepaliveDone
 	if err := s.exportSnapshotTransaction(t.Context()); err != nil {
 		t.Fatal(err)
@@ -371,6 +384,7 @@ func TestExportReplacementStopsPreviousKeepaliveAndClosesConnection(t *testing.T
 	default:
 		t.Fatal("previous keepalive still running")
 	}
+	s.startSnapshotKeepalive(t.Context(), s.exportSnapshotConn)
 	currentDone := s.keepaliveDone
 	s.Close(context.Background())
 	select {
@@ -393,6 +407,7 @@ func TestCanceledExportReplacementCleansPreviousConnection(t *testing.T) {
 	if err := s.exportSnapshotTransaction(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	s.startSnapshotKeepalive(t.Context(), s.exportSnapshotConn)
 	previousDone := s.keepaliveDone
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -437,5 +452,70 @@ func TestExportFailureCleansConnection(t *testing.T) {
 	waitClosedConnections(t, opened, closed, 1)
 	if s.exportSnapshotConn != nil || s.keepaliveDone != nil || s.keepaliveCancel != nil {
 		t.Fatal("failed export retained resources")
+	}
+}
+
+func TestCoordinatorStartsKeepaliveAfterMetadata(t *testing.T) {
+	logger.InitLogger(slog.Default())
+	for _, canceled := range []bool{false, true} {
+		t.Run(fmt.Sprint(canceled), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			addr, opened, closed := startLifecyclePostgres(t, exportSnapshotResponse)
+			dsn := "postgres://test:test@" + addr + "/test?sslmode=disable"
+			conn, err := pq.NewConnection(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := &Snapshotter{dsn: dsn}
+			defer s.Close(context.Background())
+
+			observed := false
+			s.metadataConn = &observedMetadataConnection{Connection: conn, before: func(sql string) {
+				if !strings.Contains(sql, "INSERT INTO cdc_snapshot_job") {
+					return
+				}
+				observed = true
+				if s.keepaliveDone != nil || s.keepaliveCancel != nil {
+					t.Error("keepalive started while metadata queries still own the export connection")
+				}
+				if s.exportSnapshotConn == nil || s.exportSnapshotConn.IsClosed() {
+					t.Error("export transaction was not kept open during metadata queries")
+				}
+				if canceled {
+					cancel()
+				}
+			}}
+			err = s.initializeCoordinator(ctx, "test", 0)
+			if !observed {
+				t.Fatal("metadata creation was not reached")
+			}
+			if canceled {
+				if err == nil {
+					t.Fatal("expected cancellation")
+				}
+				if s.keepaliveDone != nil || s.exportSnapshotConn != nil {
+					t.Fatal("canceled initialization retained export resources")
+				}
+				s.Close(context.Background())
+				waitClosedConnections(t, opened, closed, 2)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := s.keepaliveDone
+			if done == nil {
+				t.Fatal("successful metadata creation did not start keepalive")
+			}
+			s.Close(context.Background())
+			select {
+			case <-done:
+			default:
+				t.Fatal("Close did not join keepalive")
+			}
+			waitClosedConnections(t, opened, closed, 2)
+		})
 	}
 }
