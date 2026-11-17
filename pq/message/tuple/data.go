@@ -16,34 +16,38 @@ const (
 
 var typeMap = pgtype.NewMap()
 
-type Data struct {
-	Columns      DataColumns
-	SkipByte     int
-	ColumnNumber uint16
-}
+type (
+	Data struct {
+		Columns      DataColumns
+		SkipByte     int
+		ColumnNumber uint16
+	}
 
-type DataColumns []*DataColumn
+	DataColumns []*DataColumn
 
-type DataColumn struct {
-	Data     []byte
-	Length   uint32
-	DataType uint8
-}
+	DataColumn struct {
+		Data     []byte
+		Length   uint32
+		DataType uint8
+	}
 
-type RelationColumn struct {
-	Name         string
-	DataType     uint32
-	TypeModifier uint32
-	Flags        uint8
-}
+	RelationColumn struct {
+		Name         string
+		DataType     uint32
+		TypeModifier uint32
+		Flags        uint8
+	}
+)
 
 func NewData(data []byte, tupleDataType uint8, skipByteLength int) (*Data, error) {
 	if skipByteLength >= len(data) {
 		return nil, errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+1, len(data))
 	}
+
 	if data[skipByteLength] != tupleDataType {
 		return nil, errors.New("invalid tuple data type: " + string(data[skipByteLength]))
 	}
+
 	skipByteLength++
 
 	d := &Data{}
@@ -58,14 +62,22 @@ func (d *Data) Decode(data []byte, skipByteLength int) error {
 	if len(data) < skipByteLength+2 {
 		return errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+2, len(data))
 	}
+
 	d.ColumnNumber = binary.BigEndian.Uint16(data[skipByteLength:])
 	skipByteLength += 2
 
-	for range d.ColumnNumber {
+	if int(d.ColumnNumber) > len(data)-skipByteLength {
+		return errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+int(d.ColumnNumber), len(data))
+	}
+
+	d.Columns = make(DataColumns, 0, d.ColumnNumber)
+	columns := make([]DataColumn, d.ColumnNumber)
+	for idx := range d.ColumnNumber {
 		if skipByteLength >= len(data) {
 			return errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+1, len(data))
 		}
-		col := new(DataColumn)
+
+		col := &columns[idx]
 		col.DataType = data[skipByteLength]
 		skipByteLength++
 
@@ -75,12 +87,14 @@ func (d *Data) Decode(data []byte, skipByteLength int) error {
 			if len(data) < skipByteLength+4 {
 				return errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+4, len(data))
 			}
+
 			col.Length = binary.BigEndian.Uint32(data[skipByteLength:])
 			skipByteLength += 4
 
 			if len(data) < skipByteLength+int(col.Length) {
 				return errors.Newf("tuple data length must be at least %d byte, but got %d", skipByteLength+int(col.Length), len(data))
 			}
+
 			col.Data = make([]byte, int(col.Length))
 			copy(col.Data, data[skipByteLength:])
 
@@ -89,6 +103,7 @@ func (d *Data) Decode(data []byte, skipByteLength int) error {
 
 		d.Columns = append(d.Columns, col)
 	}
+
 	d.SkipByte = skipByteLength
 	return nil
 }
@@ -105,6 +120,7 @@ func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error
 			if err != nil {
 				return nil, errors.Wrap(err, "decode column")
 			}
+
 			decoded[colName] = val
 		}
 	}
@@ -116,5 +132,6 @@ func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
 	if dt, ok := typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}
+
 	return string(data), nil
 }

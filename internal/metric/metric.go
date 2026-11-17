@@ -1,7 +1,9 @@
 package metric
 
 import (
+	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,83 +13,88 @@ const (
 	cdcNamespace              = "go_pq_cdc"
 	replicationSlotSubsystem  = "replication_slot"
 	nanosecondsPerMillisecond = 1_000_000
+
+	MessageBufferCapacity = 1000
 )
 
-type Metric interface {
-	InsertOpIncrement(count int64)
-	UpdateOpIncrement(count int64)
-	DeleteOpIncrement(count int64)
-	LogicalMessageIncrement(count int64)
-	SetCDCLatency(latency int64)
-	SetProcessLatency(latency int64)
-	SetSlotActivity(active bool)
-	SetSlotCurrentLSN(lsn float64)
-	SetSlotConfirmedFlushLSN(lsn float64)
-	SetSlotRetainedWALSize(lsn float64)
-	SetSlotLag(lsn float64)
+type (
+	Metric interface {
+		InsertOpIncrement(count int64)
+		UpdateOpIncrement(count int64)
+		DeleteOpIncrement(count int64)
+		LogicalMessageIncrement(count int64)
+		SetCDCLatency(latency int64)
+		SetProcessLatency(latency int64)
+		SetSlotActivity(active bool)
+		SetSlotCurrentLSN(lsn float64)
+		SetSlotConfirmedFlushLSN(lsn float64)
+		SetSlotRetainedWALSize(lsn float64)
+		SetSlotLag(lsn float64)
 
-	SetSnapshotInProgress(inProgress bool)
-	SetSnapshotTotalTables(total int)
-	SetSnapshotCompletedTables(completed int)
-	SnapshotRowsIncrement(count int64)
-	SetSnapshotDurationSeconds(seconds float64)
+		SetSnapshotInProgress(inProgress bool)
+		SetSnapshotTotalTables(total int)
+		SetSnapshotCompletedTables(completed int)
+		SnapshotRowsIncrement(count int64)
+		SetSnapshotDurationSeconds(seconds float64)
 
-	// Distributed snapshot metrics
-	SetSnapshotTotalChunks(total int)
-	SetSnapshotCompletedChunks(completed int)
-	SetSnapshotActiveWorkers(workers int)
+		SetSnapshotTotalChunks(total int)
+		SetSnapshotCompletedChunks(completed int)
+		SetSnapshotActiveWorkers(workers int)
 
-	// Visibility guard metrics
-	ObserveVisibilityWait(d time.Duration)
-	VisibilityTimeoutIncrement()
-	VisibilityFailOpenIncrement()
-	SetVisibilityReplicaLag(replica string, lagBytes float64)
-	VisibilityReplicaCheck(replica string, cached bool)
+		ObserveVisibilityWait(d time.Duration)
+		VisibilityTimeoutIncrement()
+		VisibilityFailOpenIncrement()
+		SetVisibilityReplicaLag(replica string, lagBytes float64)
 
-	PrometheusCollectors() []prometheus.Collector
-}
+		DeleteVisibilityReplica(replica string)
+		VisibilityReplicaCheck(replica string, cached bool)
 
-type metric struct {
-	totalInsert prometheus.Counter
-	totalUpdate prometheus.Counter
-	totalDelete prometheus.Counter
+		SetMessageBufferSource(length func() int)
 
-	totalLogicalMessage prometheus.Counter
+		PrometheusCollectors() []prometheus.Collector
+	}
 
-	cdcLatency                 prometheus.Gauge
-	cdcLatencyMilliseconds     prometheus.Gauge
-	processLatency             prometheus.Gauge
-	processLatencyMilliseconds prometheus.Gauge
-	slotActivity               prometheus.Gauge
-	slotConfirmedFlushLSN      prometheus.Gauge
-	slotCurrentLSN             prometheus.Gauge
-	slotRetainedWALSize        prometheus.Gauge
-	slotLag                    prometheus.Gauge
+	metric struct {
+		totalInsert prometheus.Counter
+		totalUpdate prometheus.Counter
+		totalDelete prometheus.Counter
 
-	// Snapshot metrics
-	snapshotInProgress      prometheus.Gauge
-	snapshotTotalTables     prometheus.Gauge
-	snapshotCompletedTables prometheus.Gauge
-	snapshotTotalRows       prometheus.Counter
-	snapshotDurationSeconds prometheus.Gauge
+		totalLogicalMessage prometheus.Counter
 
-	// Distributed snapshot metrics
-	snapshotTotalChunks     prometheus.Gauge
-	snapshotCompletedChunks prometheus.Gauge
-	snapshotActiveWorkers   prometheus.Gauge
+		cdcLatency                 prometheus.Gauge
+		cdcLatencyMilliseconds     prometheus.Gauge
+		processLatency             prometheus.Gauge
+		processLatencyMilliseconds prometheus.Gauge
+		slotActivity               prometheus.Gauge
+		slotConfirmedFlushLSN      prometheus.Gauge
+		slotCurrentLSN             prometheus.Gauge
+		slotRetainedWALSize        prometheus.Gauge
+		slotLag                    prometheus.Gauge
 
-	// Visibility guard metrics
-	visibilityWaitDuration    prometheus.Histogram
-	visibilityTimeoutTotal    prometheus.Counter
-	visibilityFailOpenTotal   prometheus.Counter
-	visibilityReplicaLagBytes *prometheus.GaugeVec
-	visibilityReplicaChecks   *prometheus.CounterVec
-}
+		snapshotInProgress      prometheus.Gauge
+		snapshotTotalTables     prometheus.Gauge
+		snapshotCompletedTables prometheus.Gauge
+		snapshotTotalRows       prometheus.Counter
+		snapshotDurationSeconds prometheus.Gauge
 
-//nolint:funlen
+		snapshotTotalChunks     prometheus.Gauge
+		snapshotCompletedChunks prometheus.Gauge
+		snapshotActiveWorkers   prometheus.Gauge
+
+		visibilityWaitDuration    prometheus.Histogram
+		visibilityTimeoutTotal    prometheus.Counter
+		visibilityFailOpenTotal   prometheus.Counter
+		visibilityReplicaLagBytes *prometheus.GaugeVec
+		visibilityReplicaChecks   *prometheus.CounterVec
+
+		messageBufferLength prometheus.GaugeFunc
+		messageBufferSource atomic.Pointer[func() int]
+	}
+)
+
 func NewMetric(slotName string) Metric {
 	hostname, _ := os.Hostname()
-	return &metric{
+	m := &metric{
 		totalInsert: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: cdcNamespace,
 			Subsystem: "insert",
@@ -350,6 +357,26 @@ func NewMetric(slotName string) Metric {
 			},
 		}, []string{"replica", "result"}),
 	}
+	m.messageBufferLength = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Namespace: cdcNamespace,
+		Subsystem: "message_buffer",
+		Name:      "length",
+		Help:      fmt.Sprintf("messages queued in the replication stream's internal channel, waiting to be processed (capacity %d)", MessageBufferCapacity),
+		ConstLabels: prometheus.Labels{
+			"slot_name": slotName,
+			"host":      hostname,
+		},
+	}, m.readMessageBufferLength)
+	return m
+}
+
+func (m *metric) readMessageBufferLength() float64 {
+	length := m.messageBufferSource.Load()
+	if length == nil {
+		return 0
+	}
+
+	return float64((*length)())
 }
 
 func (m *metric) PrometheusCollectors() []prometheus.Collector {
@@ -380,6 +407,7 @@ func (m *metric) PrometheusCollectors() []prometheus.Collector {
 		m.visibilityFailOpenTotal,
 		m.visibilityReplicaLagBytes,
 		m.visibilityReplicaChecks,
+		m.messageBufferLength,
 	}
 }
 
@@ -439,6 +467,7 @@ func (m *metric) SetSnapshotInProgress(inProgress bool) {
 	if inProgress {
 		value = 1.0
 	}
+
 	m.snapshotInProgress.Set(value)
 }
 
@@ -486,10 +515,20 @@ func (m *metric) SetVisibilityReplicaLag(replica string, lagBytes float64) {
 	m.visibilityReplicaLagBytes.WithLabelValues(replica).Set(lagBytes)
 }
 
+func (m *metric) DeleteVisibilityReplica(replica string) {
+	m.visibilityReplicaLagBytes.DeleteLabelValues(replica)
+	m.visibilityReplicaChecks.DeletePartialMatch(prometheus.Labels{"replica": replica})
+}
+
 func (m *metric) VisibilityReplicaCheck(replica string, cached bool) {
 	result := "polled"
 	if cached {
 		result = "cached"
 	}
+
 	m.visibilityReplicaChecks.WithLabelValues(replica, result).Inc()
+}
+
+func (m *metric) SetMessageBufferSource(length func() int) {
+	m.messageBufferSource.Store(&length)
 }

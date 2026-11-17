@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -19,17 +20,37 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// startStandby streams from the primary and delays the apply of commit records
-// by applyDelay (recovery_min_apply_delay), so every event arrives while the
-// standby has the row's WAL flushed but the transaction not yet applied. It
-// returns the standby as the replica guard lists it (host:port) and a
-// superuser pool on it.
+type (
+	replicaEvent struct {
+		dispatchedAt time.Time
+		waitErr      error
+		visibleOn    []bool
+		commitLSN    pq.LSN
+		id           int32
+		visible      bool
+	}
+
+	guardedConnector struct {
+		connector cdc.Connector
+		events    <-chan replicaEvent
+
+		done chan struct{}
+	}
+)
+
 func startStandby(ctx context.Context, t *testing.T, name, applyDelay string) (string, *pgxpool.Pool) {
+	t.Helper()
+	hostPort, pool, _ := startStandbyContainer(ctx, t, name, applyDelay)
+	return hostPort, pool
+}
+
+func startStandbyContainer(ctx context.Context, t *testing.T, name, applyDelay string) (string, *pgxpool.Pool, testcontainers.Container) {
 	t.Helper()
 	version := os.Getenv(PostgresVersion)
 	if version == "" {
 		version = defaultVersion
 	}
+
 	script := fmt.Sprintf(`pg_basebackup -h primary -U postgres -D "$PGDATA" -R -X stream -C -S %s && chmod 700 "$PGDATA"
 exec postgres -c fsync=off -c max_wal_senders=100 -c max_replication_slots=50 -c recovery_min_apply_delay=%s -c primary_conninfo='host=primary user=postgres password=postgres application_name=%s'`, name, applyDelay, name)
 	standby, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -55,16 +76,18 @@ exec postgres -c fsync=off -c max_wal_senders=100 -c max_replication_slots=50 -c
 	port, err := standby.MappedPort(ctx, "5432/tcp")
 	require.NoError(t, err)
 	hostPort := fmt.Sprintf("localhost:%d", port.Int())
+	if reachContainerIPs {
+		ip, ipErr := standby.ContainerIP(ctx)
+		require.NoError(t, ipErr)
+		hostPort = net.JoinHostPort(ip, "5432")
+	}
+
 	pool, err := pgxpool.New(ctx, fmt.Sprintf("postgres://postgres:postgres@%s/%s?sslmode=disable", hostPort, Config.Database))
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	return hostPort, pool
+	return hostPort, pool, standby
 }
 
-// dropReplicationSlot removes the physical slot pg_basebackup -C created on the
-// primary. Left behind, an inactive slot pins WAL for the rest of the suite.
-// The walsender needs a moment to notice the standby is gone: until it does,
-// the slot is still active and the drop is refused.
 func dropReplicationSlot(ctx context.Context, t *testing.T, name string) {
 	t.Helper()
 	conn, err := newPostgresConn()
@@ -73,26 +96,19 @@ func dropReplicationSlot(ctx context.Context, t *testing.T, name string) {
 		return
 	}
 	defer func() { _ = conn.Close(ctx) }()
+
 	for i := 0; i < 25; i++ {
 		if err = pgExec(ctx, conn, fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", name)); err == nil {
 			return
 		}
+
 		time.Sleep(200 * time.Millisecond)
 	}
+
 	t.Logf("drop replication slot %s: %v", name, err)
 }
 
-type replicaEvent struct {
-	waitErr      error
-	dispatchedAt time.Time
-	commitLSN    pq.LSN
-	id           int32
-	visible      bool
-}
-
-// runReplicaGuardConnector starts a connector whose handler, on every insert,
-// reads the standby and records what it found; the connector is closed with t.
-func runReplicaGuardConnector(ctx context.Context, t *testing.T, cdcCfg config.Config, standby *pgxpool.Pool) <-chan replicaEvent {
+func newGuardedConnector(ctx context.Context, t *testing.T, cdcCfg config.Config, standbys ...*pgxpool.Pool) *guardedConnector {
 	t.Helper()
 	postgresConn, err := newPostgresConn()
 	require.NoError(t, err)
@@ -102,11 +118,21 @@ func runReplicaGuardConnector(ctx context.Context, t *testing.T, cdcCfg config.C
 	handler := func(lCtx *replication.ListenerContext) {
 		if ins, ok := lCtx.Message.(*format.Insert); ok {
 			ev := replicaEvent{id: ins.Decoded["id"].(int32), dispatchedAt: time.Now(), commitLSN: lCtx.CommitLSN}
-			var n int
-			ev.visible = standby.QueryRow(ctx, "SELECT count(*) FROM books WHERE id = $1", ev.id).Scan(&n) == nil && n == 1
-			ev.waitErr = replication.WaitReplayed(ctx, standby, lCtx.CommitLSN, replication.WaitOptions{Timeout: 500 * time.Millisecond})
+			for _, standby := range standbys {
+				qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				var n int
+				ev.visibleOn = append(ev.visibleOn, standby.QueryRow(qCtx, "SELECT count(*) FROM books WHERE id = $1", ev.id).Scan(&n) == nil && n == 1)
+				cancel()
+			}
+
+			ev.visible = len(ev.visibleOn) > 0 && ev.visibleOn[0]
+			if len(standbys) > 0 {
+				ev.waitErr = replication.WaitReplayed(ctx, standbys[0], lCtx.CommitLSN, replication.WaitOptions{Timeout: 500 * time.Millisecond})
+			}
+
 			events <- ev
 		}
+
 		_ = lCtx.Ack()
 	}
 	connector, err := cdc.NewConnector(ctx, cdcCfg, handler)
@@ -116,31 +142,43 @@ func runReplicaGuardConnector(ctx context.Context, t *testing.T, cdcCfg config.C
 		_ = RestoreDB(ctx)
 		_ = postgresConn.Close(ctx)
 	})
-	go connector.Start(ctx)
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	require.NoError(t, connector.WaitUntilReady(waitCtx))
-	return events
+	return &guardedConnector{connector: connector, events: events, done: make(chan struct{})}
 }
 
-// waitStandbyCaughtUp blocks until the standby has replayed everything the
-// primary has written so far. The test setup drops and recreates books; while
-// that transaction's commit sits in the apply delay the standby holds its
-// AccessExclusiveLock, and a read of books there would block (forever, once
-// replay is paused). Start every scenario from a caught-up standby.
-func waitStandbyCaughtUp(ctx context.Context, t *testing.T, primary, standby *pgxpool.Pool) {
+func (g *guardedConnector) start(ctx context.Context, timeout time.Duration) error {
+	go func() {
+		g.connector.Start(ctx)
+		close(g.done)
+	}()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	return g.connector.WaitUntilReady(waitCtx)
+}
+
+func runReplicaGuardConnector(ctx context.Context, t *testing.T, cdcCfg config.Config, standby *pgxpool.Pool) <-chan replicaEvent {
+	t.Helper()
+	g := newGuardedConnector(ctx, t, cdcCfg, standby)
+	require.NoError(t, g.start(ctx, 15*time.Second))
+	return g.events
+}
+
+func waitStandbyCaughtUp(ctx context.Context, t *testing.T, primary *pgxpool.Pool, standbys ...*pgxpool.Pool) {
 	t.Helper()
 	var lsn string
 	require.NoError(t, primary.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&lsn))
 	deadline := time.Now().Add(15 * time.Second)
-	for {
-		var caughtUp bool
-		require.NoError(t, standby.QueryRow(ctx, "SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn", lsn).Scan(&caughtUp))
-		if caughtUp {
-			return
+	for _, standby := range standbys {
+		for {
+			var caughtUp bool
+			require.NoError(t, standby.QueryRow(ctx, "SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn", lsn).Scan(&caughtUp))
+			if caughtUp {
+				break
+			}
+
+			require.False(t, time.Now().After(deadline), "standby did not catch up to %s", lsn)
+			time.Sleep(100 * time.Millisecond)
 		}
-		require.False(t, time.Now().After(deadline), "standby did not catch up to %s", lsn)
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -155,8 +193,6 @@ func nextEvent(t *testing.T, events <-chan replicaEvent, within time.Duration) r
 	}
 }
 
-// TestReplicaGuard runs against a standby that applies commit records 3s late.
-// See docs/replica-guard-design.md (R11).
 func TestReplicaGuard(t *testing.T) {
 	const applyDelay = 3 * time.Second
 	ctx := context.Background()
@@ -235,6 +271,7 @@ func TestReplicaGuard(t *testing.T) {
 		go connector.Start(ctx)
 		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
+
 		assert.Error(t, connector.WaitUntilReady(waitCtx), "stream must not become ready when a listed replica is not in recovery")
 	})
 }

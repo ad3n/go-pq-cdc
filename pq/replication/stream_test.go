@@ -16,6 +16,22 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+type (
+	receiveErrorConn struct{}
+
+	standbyCaptureConn struct {
+		fe     *pgproto3.Frontend
+		closed bool
+	}
+
+	startupConn struct {
+		fe        *pgproto3.Frontend
+		connected bool
+	}
+
+	countingWriter struct{ n int }
+)
+
 func TestStreamCloseBeforeOpenDoesNotBlock(t *testing.T) {
 	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {})
 
@@ -38,12 +54,38 @@ func TestStreamCloseAfterOpenFailureDoesNotBlock(t *testing.T) {
 	requireCloseReturns(t, stream, "Close blocked after Open failed before starting the sink")
 }
 
+func TestStreamCloseIsOrderedWithRejectedOpen(t *testing.T) {
+	var socket countingWriter
+	conn := &startupConn{fe: pgproto3.NewFrontend(strings.NewReader(""), &socket)}
+
+	_ = conn.Connect(context.Background())
+
+	s := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
+	s.conn = conn
+	s.UpdateConfirmedXLogPos(1)
+
+	openErr := make(chan error, 1)
+	go func() { openErr <- s.Open(context.Background()) }()
+
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := <-openErr; err == nil {
+		t.Fatal("Open must fail: the server rejected START_REPLICATION, or Close closed the connection first")
+	}
+
+	if !conn.IsClosed() {
+		t.Fatal("Close must close the replication connection whichever ran first")
+	}
+}
+
 func TestStreamSinkExitStopsProcessor(t *testing.T) {
 	logger.InitLogger(logger.NewSlog(slog.LevelError))
 
 	stream := NewStream("", config.Config{}, metric.NewMetric("test_slot"), func(*ListenerContext) {}).(*stream)
 	stream.conn = receiveErrorConn{}
-	// Simulate Close marking the stream closed before ReceiveMessage unblocks.
+
 	stream.closed.Store(true)
 	stream.processStarted.Store(true)
 
@@ -52,6 +94,7 @@ func TestStreamSinkExitStopsProcessor(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+
 		stream.sink(context.Background())
 	}()
 
@@ -86,9 +129,11 @@ func TestStreamCloseFlushesFinalConfirmedLSN(t *testing.T) {
 	if written.Len() == 0 {
 		t.Fatal("expected final standby status update to be written")
 	}
+
 	if !bytes.Contains(written.Bytes(), []byte{StandbyStatusUpdateByteID}) {
 		t.Fatal("expected standby status update payload")
 	}
+
 	if !conn.closed {
 		t.Fatal("expected connection to be closed")
 	}
@@ -109,8 +154,6 @@ func requireCloseReturns(t *testing.T, stream Streamer, msg string) {
 		t.Fatal(msg)
 	}
 }
-
-type receiveErrorConn struct{}
 
 func (receiveErrorConn) Connect(context.Context) error {
 	return nil
@@ -134,11 +177,6 @@ func (receiveErrorConn) Frontend() *pgproto3.Frontend {
 
 func (receiveErrorConn) Exec(context.Context, string) *pgconn.MultiResultReader {
 	return nil
-}
-
-type standbyCaptureConn struct {
-	fe     *pgproto3.Frontend
-	closed bool
 }
 
 func (c *standbyCaptureConn) Connect(context.Context) error {
@@ -181,4 +219,35 @@ func TestFetchSnapshotLSNStopsOnCancellation(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("snapshot LSN retry ignored cancellation")
 	}
+}
+
+func (c *startupConn) Connect(context.Context) error {
+	c.connected = true
+	return nil
+}
+
+func (c *startupConn) IsClosed() bool {
+	return !c.connected
+}
+
+func (c *startupConn) Close(context.Context) error {
+	c.connected = false
+	return nil
+}
+
+func (c *startupConn) ReceiveMessage(context.Context) (pgproto3.BackendMessage, error) {
+	return &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42704", Message: "replication slot does not exist"}, nil
+}
+
+func (c *startupConn) Frontend() *pgproto3.Frontend {
+	return c.fe
+}
+
+func (c *startupConn) Exec(context.Context, string) *pgconn.MultiResultReader {
+	return nil
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += len(p)
+	return len(p), nil
 }

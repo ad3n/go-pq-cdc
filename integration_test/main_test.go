@@ -25,13 +25,15 @@ import (
 var (
 	Config    config.Config
 	Container testcontainers.Container
-	// Network joins the primary (alias "primary") and the standbys some tests start.
-	Network *testcontainers.DockerNetwork
-)
 
-var (
+	Network *testcontainers.DockerNetwork
+
 	PostgresVersion = "POSTGRES_VERSION"
 	defaultVersion  = "16-alpine"
+
+	reachContainerIPs = os.Getenv("INTEGRATION_CONTAINER_IPS") != ""
+
+	protoVersions = []int{1, 2}
 )
 
 func TestMain(m *testing.M) {
@@ -40,10 +42,11 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	Config.SetDefault()
 
 	ctx := context.Background()
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true") // Podman: disable Ryuk
+	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 	Network, err = network.New(ctx)
 	if err != nil {
 		log.Fatal("create test network", err)
@@ -53,6 +56,7 @@ func TestMain(m *testing.M) {
 			log.Fatal("remove test network", err)
 		}
 	}()
+
 	Container, err = SetupTestContainer(ctx, Config)
 	if err != nil {
 		log.Fatal("setup test container", err)
@@ -68,8 +72,16 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatal("get mapped port", err)
 	}
+
 	Config.Host = "localhost"
 	Config.Port = mappedPort.Int()
+	if reachContainerIPs {
+		if Config.Host, err = Container.ContainerIP(ctx); err != nil {
+			log.Fatal("get container ip", err)
+		}
+
+		Config.Port = 5432
+	}
 
 	conn, err := newPostgresConn()
 	if err != nil {
@@ -197,18 +209,17 @@ func createCDCUser(ctx context.Context, conn pq.Connection, cfg config.Config) e
 	return nil
 }
 
-// allowReplicationConnections lets standbys started by tests stream from the
-// primary: the image's default pg_hba.conf only opens "all" databases, and the
-// replication pseudo-database needs its own line.
 func allowReplicationConnections(ctx context.Context, conn pq.Connection) error {
 	code, out, err := Container.Exec(ctx, []string{"sh", "-c", `echo "host replication all all scram-sha-256" >> "$PGDATA/pg_hba.conf"`})
 	if err != nil {
 		return errors.Wrap(err, "append pg_hba replication line")
 	}
+
 	if code != 0 {
 		b, _ := io.ReadAll(out)
 		return errors.Newf("append pg_hba replication line: exit %d: %s", code, b)
 	}
+
 	return pgExec(ctx, conn, "SELECT pg_reload_conf()")
 }
 
@@ -251,13 +262,6 @@ func pgExec(ctx context.Context, conn pq.Connection, command string) error {
 	return nil
 }
 
-// protoVersions lists the pgoutput protocol versions that every CDC
-// integration test should exercise.
-var protoVersions = []int{1, 2}
-
-// forEachProtoVersion runs fn as a subtest for every protocol version.
-// It copies cdcCfg, sets ProtoVersion, and appends "_v{N}" to the slot name
-// so that parallel subtests don't collide.
 func forEachProtoVersion(t *testing.T, cdcCfg config.Config, fn func(t *testing.T, cfg config.Config)) {
 	t.Helper()
 	for _, v := range protoVersions {
@@ -314,5 +318,6 @@ func fetchMetrics(metricName string) (string, error) {
 			}
 		}
 	}
+
 	return "", errors.Newf("metric %s not found in response", metricName)
 }
